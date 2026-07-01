@@ -15,6 +15,10 @@ struct PortInfo: Identifiable, Hashable {
 
     var id: String { "\(pid)-\(port)-\(proto)" }
 
+    var isDockerManaged: Bool {
+        DockerDetector.isDockerManaged(processName: processName)
+    }
+
     /// Case-insensitive substring match against port, process name, framework
     /// label, project name, and git branch -- used to power the search field.
     func matches(query: String) -> Bool {
@@ -27,7 +31,8 @@ struct PortInfo: Identifiable, Hashable {
             processName,
             frameworkLabel,
             projectName,
-            gitBranch
+            gitBranch,
+            isDockerManaged ? "docker" : nil
         ]
         return haystacks.contains { $0?.lowercased().contains(needle) == true }
     }
