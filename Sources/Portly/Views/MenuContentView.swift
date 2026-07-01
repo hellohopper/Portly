@@ -111,6 +111,12 @@ private struct PortRow: View {
                 HStack(spacing: 6) {
                     Text(verbatim: "\(info.port)")
                         .font(.system(.body, design: .monospaced).bold())
+                    if info.isDockerManaged {
+                        Image(systemName: "shippingbox.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                            .help("Container-mapped port (Docker)")
+                    }
                     if let projectName = info.projectName {
                         Text(projectLabel(name: projectName, branch: info.gitBranch))
                             .font(.caption)
