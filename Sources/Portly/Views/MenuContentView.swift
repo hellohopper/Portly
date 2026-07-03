@@ -1,4 +1,21 @@
 import SwiftUI
+import AppKit
+
+/// Grabs the NSWindow hosting this SwiftUI hierarchy so the key monitor can
+/// ignore events destined for other windows (label editor, Settings popover...).
+private struct WindowAccessor: NSViewRepresentable {
+    @Binding var window: NSWindow?
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async { window = view.window }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async { window = nsView.window }
+    }
+}
 
 struct MenuContentView: View {
     @ObservedObject var store: PortStore
@@ -9,6 +26,9 @@ struct MenuContentView: View {
     @State private var selectedPorts: Set<Int> = []
     @State private var isSettingsPresented: Bool = false
     @State private var isHistoryPresented: Bool = false
+    @State private var focusedPort: Int?
+    @State private var keyMonitor: Any?
+    @State private var hostWindow: NSWindow?
 
     private var theme: AppTheme {
         AppTheme(rawValue: themeRawValue) ?? .system
@@ -53,36 +73,44 @@ struct MenuContentView: View {
                         .foregroundStyle(.secondary)
                         .padding()
                 } else {
-                    ScrollView {
-                        ForEach(sections) { section in
-                            Text(section.title.uppercased())
-                                .font(.caption2.bold())
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 12)
-                                .padding(.top, 8)
-                                .padding(.bottom, 2)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            ForEach(sections) { section in
+                                Text(section.title.uppercased())
+                                    .font(.caption2.bold())
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 12)
+                                    .padding(.top, 8)
+                                    .padding(.bottom, 2)
 
-                            ForEach(section.ports) { port in
-                                PortRow(
-                                    info: port,
-                                    isPinned: store.pinnedPorts.contains(port.port),
-                                    isSelecting: isSelecting,
-                                    isSelected: selectedPorts.contains(port.port),
-                                    label: store.effectiveLabel(for: port.port),
-                                    healthStatus: store.healthStatuses[port.port],
-                                    onKill: { store.kill(port) },
-                                    onKillTree: { store.killTree(port) },
-                                    onTogglePin: { store.togglePin(port.port) },
-                                    onToggleSelect: { toggleSelection(port.port) },
-                                    onRestart: { store.restart(port) },
-                                    onIgnore: { store.ignoreProcessName(port.processName) },
-                                    onSetLabel: { store.setLabel($0, for: port.port) }
-                                )
-                                Divider()
+                                ForEach(section.ports) { port in
+                                    PortRow(
+                                        info: port,
+                                        isPinned: store.pinnedPorts.contains(port.port),
+                                        isSelecting: isSelecting,
+                                        isSelected: selectedPorts.contains(port.port),
+                                        isFocused: focusedPort == port.port,
+                                        label: store.effectiveLabel(for: port.port),
+                                        healthStatus: store.healthStatuses[port.port],
+                                        onKill: { store.kill(port) },
+                                        onKillTree: { store.killTree(port) },
+                                        onTogglePin: { store.togglePin(port.port) },
+                                        onToggleSelect: { toggleSelection(port.port) },
+                                        onRestart: { store.restart(port) },
+                                        onIgnore: { store.ignoreProcessName(port.processName) },
+                                        onSetLabel: { store.setLabel($0, for: port.port) }
+                                    )
+                                    Divider()
+                                }
                             }
                         }
+                        .frame(maxHeight: 420)
+                        .onChange(of: focusedPort) { newValue in
+                            guard let newValue,
+                                  let row = filteredPorts.first(where: { $0.port == newValue }) else { return }
+                            withAnimation { proxy.scrollTo(row.id) }
+                        }
                     }
-                    .frame(maxHeight: 420)
                 }
             }
 
@@ -133,6 +161,62 @@ struct MenuContentView: View {
         }
         .frame(width: 400)
         .preferredColorScheme(theme.colorScheme)
+        .background(WindowAccessor(window: $hostWindow))
+        .onAppear { installKeyMonitor() }
+        .onDisappear { removeKeyMonitor() }
+    }
+
+    // MARK: - Keyboard navigation
+
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handleKeyDown(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+        }
+        keyMonitor = nil
+    }
+
+    /// Returns true when the event was consumed. Events for other windows (label
+    /// editor, Settings/History popovers) are always passed through.
+    private func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard event.window === hostWindow else { return false }
+
+        let visiblePorts = sections.flatMap(\.ports).map(\.port)
+
+        switch event.keyCode {
+        case 125: // down arrow
+            focusedPort = KeyboardNavigator.move(from: focusedPort, in: visiblePorts, direction: .down)
+            return true
+        case 126: // up arrow
+            focusedPort = KeyboardNavigator.move(from: focusedPort, in: visiblePorts, direction: .up)
+            return true
+        case 36, 76: // return / keypad enter
+            guard let focused = focusedRow(), focused.proto.contains("TCP"),
+                  let url = URL(string: "http://localhost:\(focused.port)") else { return false }
+            NSWorkspace.shared.open(url)
+            return true
+        case 51 where event.modifierFlags.contains(.command): // cmd-delete
+            guard let focused = focusedRow() else { return false }
+            store.kill(focused)
+            return true
+        case 53: // escape: clear the search first; a second press closes the popover
+            guard !searchText.isEmpty else { return false }
+            searchText = ""
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func focusedRow() -> PortInfo? {
+        guard let focusedPort else { return nil }
+        return filteredPorts.first { $0.port == focusedPort }
     }
 
     private func toggleSelection(_ port: Int) {
@@ -212,6 +296,7 @@ private struct PortRow: View {
     let isPinned: Bool
     let isSelecting: Bool
     let isSelected: Bool
+    let isFocused: Bool
     let label: String?
     let healthStatus: Int?
     let onKill: () -> Void
@@ -343,6 +428,7 @@ private struct PortRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .background(isFocused ? Color.accentColor.opacity(0.12) : Color.clear)
         .contentShape(Rectangle())
         .onTapGesture {
             if isSelecting { onToggleSelect() }
